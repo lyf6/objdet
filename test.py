@@ -1,4 +1,4 @@
-from generate import Single_Anchor, Anchors
+from utils.generate import Single_Anchor, Anchors
 import numpy as np
 base_size = np.array(8)
 ratios = np.array([0.25, 1, 4])
