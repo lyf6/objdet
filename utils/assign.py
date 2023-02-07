@@ -161,9 +161,13 @@ def TaskAlignedAssigner(preds, gts):
 
 def SimOTAAssigner():
     """
-    step 1: 计算预测框bboxes
-    step 2:
-    step 3:
+    step 1: 计算预测的pred_bboxes与 gt_boxes之间的overlaps
+    step 2: 计算预测的cls_scores的交叉熵
+    step 3: 计算每一个gt_boxes与pred_bboxes的度量函数metrics_matrix,该度量函数的定义为-alpha*lg(overlaps)-beta*cross_entropy
+    step 4: 同时判断每一个预测出来的pred_bboxes是否满足以下两个条件：
+            cond 1: pred_bboxes的中心在gt_boxes之中
+            cond 2: pred_bboxes在gt_boxes的半径gama范围内
+            将不满足以上任何一个条件的预测框滤除，不认定为正样本，
     """
 
 
