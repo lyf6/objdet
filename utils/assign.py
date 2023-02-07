@@ -129,7 +129,7 @@ def Single_TaskAlignedAssigner(pred_bboxes, pred_cls, gt_boxes, cls_ids, overlap
     is_in_target = is_in_targetbox(pred_bboxes, gt_boxes)
     candicate_matrix[~is_in_target] = -1 # step 5
     # step 6
-    sum_candicate_matrix = (candicate_matrix==1).sum(axis=1)>1
+    sum_candicate_matrix = (candicate_matrix==1).sum(axis=1)>1 #可能有问题
     sub_candicate_matrix = candicate_matrix[sum_candicate_matrix, :]
     index = np.argmax(sub_candicate_matrix, axis=1)
     candicate_matrix[sum_candicate_matrix, :] = -1
@@ -158,6 +158,80 @@ def TaskAlignedAssigner(preds, gts):
     gt_boxes = gts['gt_boxes']
     cls_ids = gts['cls_ids']
 
+def is_in_radius(boxes, target_boxes, radius=2):
+    """
+    判断boxes的中心是否在target_boxes中心，半径为radius的矩形框中
+    """
+    t_cnt_x = (target_boxes[:,2] + target_boxes[:,0])/2.0
+    t_cnt_y = (target_boxes[:,3] + target_boxes[: 1])/2.0
+    dumy_boxes = np.stack([t_cnt_x-2, t_cnt_y-2, t_cnt_x+2, t_cnt_y+2], axis=1)
+    cnt_x_boxes, cnt_y_boxes = (boxes[:, 2] + boxes[:, 0]) / 2.0, (boxes[:, 3] + boxes[:, 1]) / 2.0
+    tl_x = cnt_x_boxes[:, None] - dumy_boxes[:, 0][None, :]
+    tl_y = cnt_y_boxes[:, None] - dumy_boxes[:, 1][None, :]
+    br_x = dumy_boxes[:, 2][None, :] - cnt_x_boxes[:, None] 
+    br_y = dumy_boxes[:, 3][None, :] - cnt_y_boxes[:, None]
+    is_in_dius = (tl_x > 0)&(tl_y > 0)&(br_x > 0)&(br_y > 0)
+    return is_in_dius
+
+
+def Single_SimOTAAssigner(pred_bboxes, pred_cls, gt_boxes, cls_ids, overlap_beta=6, score_alpha=1, radius=2):
+    """
+    step 1: 计算预测的pred_bboxes与 gt_boxes之间的overlaps
+    step 2: 计算预测的cls_scores的交叉熵
+    step 3: 计算每一个gt_boxes与pred_bboxes的度量函数metrics_matrix,该度量函数的定义为-alpha*lg(overlaps)-beta*cross_entropy
+    step 4: 同时判断每一个预测出来的pred_bboxes是否满足以下两个条件：
+            cond 1: pred_bboxes的中心在gt_boxes之中
+            cond 2: pred_bboxes在gt_boxes的半径gama范围内
+            将不满足以上任何一个条件的预测框滤除，不认定为正样本invalid, 对于仅满足其中一个条件的pred_bbox施加
+            惩罚，对其对应的metrics_matrix施加一个惩罚数
+    step 5: 对每一个gt_box, 计算所有pred_bboxes与它的overlaps之和sum_overlaps,对overlaps取整，计算出应该与之对应的pred_bboxes个数dynatic_k;
+    step 6: 根据metrics_matrix计算出每一个gt_boxes所对应的dynatic_k个pred_bboxes;
+    step 7: 对于step 6得到的pred_bboxes, 如果某一个pred_bboxes对应多个gt_bboxes(即被多个gt_boxes选择位候选框)，则保留metric_matrix
+            值最小的那个gt_box
+    args:
+    pred_bboxes: nx4
+    pred_cls: nxc
+    gt_bboxes: mx4
+    cls_ids: mx1
+    returns:
+    candicate_ids nx1    
+    """
+    num_priors, cls_num = pred_cls.shape
+    num_gts = len(cls_ids)
+    overlaps = box_iox_xyxy(pred_bboxes, gt_boxes) # nxm
+    cls_ids = np.tile(cls_ids, num_priors) # nm
+    one_hot = np.eye(cls_num)[cls_ids] #nmxc
+    reapeat_cls_scores = np.tile(pred_cls[:, None, :], (1, num_gts, 1)) #nmxc
+    loss_cross_entropy = -(one_hot*np.log(reapeat_cls_scores)).sum(axis=1).reshape(axis=1) # nxm
+    loss_overlaps = -np.log(overlaps) # nxm
+    is_in_gts = is_in_targetbox(pred_bboxes, gt_boxes)
+    is_in_radius_gt = is_in_radius(pred_bboxes, gt_boxes, radius=radius)
+    valid = is_in_gts or is_in_radius_gt
+    is_in_gt_radius = is_in_gts and is_in_radius
+    candicate_matrix = -1 * np.ones(shape=(num_priors, num_gts))
+    assigned_gt_inds = -1 * np.ones(shape=(num_priors))
+    sub_candicate_matrix = candicate_matrix[valid, :]
+    sub_metrics = loss_cross_entropy[valid, :] * score_alpha + loss_overlaps[valid, :] * overlap_beta + ~(is_in_gt_radius)*2000
+    #针对每一个gt_box, 计算dynamic_k
+    dynamic_k = int(np.sum(overlaps, axis=0))
+    dynamic_k = np.minimum(dynamic_k, 1)
+    for id, top_k in enumerate(dynamic_k):
+        ind = np.argsort(sub_metrics[:, id])
+        ind = np.take(ind, range(top_k))
+        sub_candicate_matrix[ind, id] = 1
+    
+    #对于每一个筛选出来的候选框，如果它对应多个gt_boxes,则选择metric最小的那个
+    sum_sub_candicate_matrix = np.sum((sub_candicate_matrix==1), axis=1)>1
+    sub_sub_candicate_matrix = sub_candicate_matrix[sum_sub_candicate_matrix, :]
+    index = np.argmin(sub_candicate_matrix, axis=1)
+    sub_sub_candicate_matrix = -1
+    sub_sub_candicate_matrix[range(len(index)), index] = 1
+    sub_candicate_matrix[sum_sub_candicate_matrix, :] = sub_sub_candicate_matrix
+    candicate_matrix[valid, :] = sub_candicate_matrix
+    bbox_ids, gt_box_ids = np.argwhere(candicate_matrix==1) 
+    assigned_gt_inds[bbox_ids] = gt_box_ids
+    return assigned_gt_inds
+    
 
 def SimOTAAssigner():
     """
@@ -167,8 +241,14 @@ def SimOTAAssigner():
     step 4: 同时判断每一个预测出来的pred_bboxes是否满足以下两个条件：
             cond 1: pred_bboxes的中心在gt_boxes之中
             cond 2: pred_bboxes在gt_boxes的半径gama范围内
-            将不满足以上任何一个条件的预测框滤除，不认定为正样本，
+            将不满足以上任何一个条件的预测框滤除，不认定为正样本invalid, 对于仅满足其中一个条件的pred_bbox施加
+            惩罚，对其对应的metrics_matrix施加一个惩罚数
+    step 5: 对每一个gt_box, 计算所有pred_bboxes与它的overlaps之和sum_overlaps,对overlaps取整，计算出应该与之对应的pred_bboxes个数dynatic_k;
+    step 6: 根据metrics_matrix计算出每一个gt_boxes所对应的dynatic_k个pred_bboxes;
+    step 7: 对于step 6得到的pred_bboxes, 如果某一个pred_bboxes对应多个gt_bboxes(即被多个gt_boxes选择位候选框)，则保留metric_matrix
+            值最小的那个gt_box
     """
+    
 
 
 
